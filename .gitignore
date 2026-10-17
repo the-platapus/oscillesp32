@@ -1,0 +1,37 @@
+# ── Things the compiler made ────────────────────────────────────────────────
+# ESP-IDF regenerates all of this, and it is enormous. Also where the
+# OLED previews from ./test/run_host_oled.sh end up.
+build/
+
+# Generated from sdkconfig.defaults on every build. Edit the defaults, not this.
+sdkconfig
+sdkconfig.old
+
+# Only exist if someone builds with ESP-IDF 5 and the component manager
+managed_components/
+dependencies.lock
+
+# ── Things your editor made ─────────────────────────────────────────────────
+.vscode/
+.idea/
+.cache/
+.clangd/
+compile_commands.json
+*.swp
+*.swo
+*~
+
+# ── Things your OS made without asking ──────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Things Python made while flashing ───────────────────────────────────────
+__pycache__/
+*.pyc
+
+# ── Things you made at 2 a.m. ───────────────────────────────────────────────
+*.log
+*.orig
+*.rej
+scratch/
