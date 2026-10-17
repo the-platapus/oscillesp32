@@ -4,6 +4,8 @@
 #include "driver/ledc.h"
 #include "driver/dac.h"
 #include "driver/gpio.h"
+#include "hal/misc.h"
+#include "soc/sens_struct.h"
 
 static const ledc_mode_t MODE = LEDC_HIGH_SPEED_MODE;
 static const ledc_timer_t TIMER = LEDC_TIMER_0;
@@ -70,6 +72,11 @@ static void sineApply() {
     cw.freq = (uint32_t)hz;
     cw.offset = 0;
     dac_cw_generator_config(&cw);
+    // ESP-IDF 4.4's dac_ll_cw_set_dc_offset() writes -128 into the DC-offset
+    // register when asked for 0. That shifts the wave down by half the DAC
+    // range, so the negative half-cycles clamp at 0 V and only half a sine
+    // comes out. Write the real zero.
+    HAL_FORCE_MODIFY_U32_REG_FIELD(SENS.sar_dac_ctrl2, dac_dc1, 0);
     dac_cw_generator_enable();
     dac_output_enable(DAC_CHANNEL_1);
     sSineRunning = true;

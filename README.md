@@ -252,6 +252,11 @@ handles them all for you, but in case you're building your own:
 - **ESP-IDF 4.4 turns your DACs off behind your back.** `i2s_driver_uninstall()`
   disables both DAC outputs. If you restart the ADC, re-enable them, or your
   sine generator quietly stops.
+- **...and asks for "no offset" by adding −128.** Configure the DAC cosine
+  generator with offset 0 and ESP-IDF 4.4 writes −128 into the DC-offset
+  register. The negative half of the wave falls off the bottom of the DAC and
+  you get a row of half-sine humps. The firmware writes the real zero after
+  configuring it.
 - **A floating ADC pin reads ~0.2 V with random spikes.** If the self-test says
   your 3.3 V square peaks at 985 codes, check which pin your jumper is in
   before blaming silicon. (See: "ask us how we know".)
