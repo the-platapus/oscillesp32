@@ -16,6 +16,10 @@ float  siggenOverrideSquare(float hz, float dutyPct);
 // siggenApply()/siggenOverrideSquare() take it back.
 void   siggenReleaseSquare();
 
+// Holds GPIO26 at a steady logic level: 0 V or the 3V3 rail (selftest's
+// front-end calibration). siggenApply()/siggenOverrideSquare() take it back.
+void   siggenHoldSquare(int level);
+
 // Re-enables the sine output after something switched the DACs off
 // (ESP-IDF's I2S driver uninstall does).
 void   siggenRestoreDac();

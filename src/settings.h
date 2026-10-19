@@ -55,7 +55,12 @@ struct Settings {
   uint8_t wifiMode;      // 0 = off, 1 = access point, 2 = join network (falls back to AP)
   char    staSsid[33];
   char    staPass[65];
+  // sits in what was tail padding, so older saves still load (and read 0 here)
+  uint8_t deglitchOff;   // 1 = skip the median-of-3 filter on ADC samples
 };
+// Settings are saved as one blob; a different size means the old save is
+// dropped (calibration, WiFi password and all). Grow it only on purpose.
+static_assert(sizeof(Settings) == 168, "Settings layout changed: old saves won't load");
 
 extern Settings S;
 extern volatile uint32_t gSettingsVersion;   // bumped on every change

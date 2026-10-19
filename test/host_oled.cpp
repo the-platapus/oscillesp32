@@ -28,6 +28,7 @@ float siggenSquareActualHz() { return 0; }
 float siggenSineActualHz() { return 0; }
 float siggenOverrideSquare(float, float) { return 0; }
 void siggenReleaseSquare() {}
+void siggenHoldSquare(int) {}
 void siggenRestoreDac() {}
 
 static uint64_t sIdx = 0;

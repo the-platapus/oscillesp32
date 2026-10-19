@@ -105,6 +105,13 @@ float siggenOverrideSquare(float hz, float dutyPct) {
 
 void siggenReleaseSquare() { squareStop(); }
 
+void siggenHoldSquare(int level) {
+  squareStop();
+  gpio_reset_pin((gpio_num_t)PIN_GEN_SQUARE);   // also takes it out of DAC/RTC mode
+  gpio_set_direction((gpio_num_t)PIN_GEN_SQUARE, GPIO_MODE_OUTPUT);
+  gpio_set_level((gpio_num_t)PIN_GEN_SQUARE, level ? 1 : 0);
+}
+
 void siggenRestoreDac() {
   if (sSineRunning) sineApply();
 }

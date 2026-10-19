@@ -58,7 +58,8 @@ static volatile bool sRearmReq = false;
 static volatile bool sReinitReq = false;     // restart I2S with S.hwRate / S.sarClkDiv / S.sarCycles
 
 // ---- tuner (selftest) ----
-static volatile bool sTuneReq = false, sTuneDone = false, sTuneOk = false;
+static volatile bool sTuneReq = false, sTuneDone = false;
+static volatile TuneResult sTuneResult = TUNE_FAIL;
 static volatile bool sTuneJumperOnly = false;
 static char* volatile sTuneOut = nullptr;
 static volatile size_t sTuneOutLen = 0;
@@ -116,6 +117,11 @@ struct HwCfg {
 };
 
 static HwCfg savedCfg() { return {S.hwRate, S.sarClkDiv, S.sarCycles}; }
+
+// Sample-and-hold time in 1/80 MHz units. Longer settles better behind a
+// front-end's source resistance (22k/22k/100k, against the 400 ns default:
+// 50 ns read 21 mV low, 100 ns 3.5 mV, 300 ns 1.5 mV).
+static uint32_t sampleWindow(const HwCfg& h) { return (h.div ? h.div : 16) * (h.cyc ? h.cyc : 2); }
 
 static bool sI2sRunning = false;
 
@@ -225,6 +231,21 @@ static bool measureLevel(uint16_t* buf, uint8_t dacLevel, LevelStats& r) {
   return captureStats(buf, r);
 }
 
+// Median of three captures. One 4 ms capture now and then reads 10-20 codes
+// off (seen behind front-end B, likely WiFi bursts); that matters where a few
+// codes count.
+static bool measureLevelMedian(uint16_t* buf, uint8_t dacLevel, LevelStats& r) {
+  LevelStats s[3];
+  for (auto& x : s) if (!measureLevel(buf, dacLevel, x)) return false;
+  int lo = 0, hi = 0;
+  for (int i = 1; i < 3; i++) {
+    if (s[i].mean < s[lo].mean) lo = i;
+    if (s[i].mean >= s[hi].mean) hi = i;
+  }
+  r = s[lo == hi ? 0 : 3 - lo - hi];
+  return true;
+}
+
 // Starts the hardware and works out the true conversion rate. The SAR
 // controller pauses for 2 conversions every 256 (its measurement limit), so
 // the ADC delivers 256/258 of the requested rate; other silicon/driver
@@ -285,39 +306,43 @@ static bool tuneStart(const HwCfg& h) {
   return true;
 }
 
+static const int JUMPER_TRIES = 10;
+
 // Digital continuity test, independent of the ADC: drive GPIO26 as a logic
 // output and read GPIO34 as a logic input. Must run with the I2S/ADC stopped;
-// i2sStart() hands GPIO34 back to the ADC.
-static bool jumperCheck(char* out, size_t len) {
+// i2sStart() hands GPIO34 back to the ADC. *highs = how often GPIO34 read high.
+static bool jumperCheck(char* out, size_t len, int* highs) {
   gpio_reset_pin((gpio_num_t)PIN_GEN_SQUARE);   // also takes it out of DAC/RTC mode
   gpio_set_direction((gpio_num_t)PIN_GEN_SQUARE, GPIO_MODE_OUTPUT);
   gpio_config_t in = {};
   in.pin_bit_mask = 1ULL << PIN_PROBE;
   in.mode = GPIO_MODE_INPUT;                    // GPIO34 has no pull resistors
   gpio_config(&in);
-  const int tries = 10;
-  int match = 0, highs = 0;
-  for (int i = 0; i < tries; i++) {
+  int match = 0;
+  *highs = 0;
+  for (int i = 0; i < JUMPER_TRIES; i++) {
     int lvl = i & 1;
     gpio_set_level((gpio_num_t)PIN_GEN_SQUARE, lvl);
     vTaskDelay(pdMS_TO_TICKS(3));
     int r = gpio_get_level((gpio_num_t)PIN_PROBE);
     if (r == lvl) match++;
-    highs += r;
+    *highs += r;
   }
   gpio_set_level((gpio_num_t)PIN_GEN_SQUARE, 0);
   gpio_reset_pin((gpio_num_t)PIN_GEN_SQUARE);
-  bool ok = match == tries;
-  appendf(out, len, "jumper check: GPIO34 followed GPIO26 %d/%d times -> %s\n", match, tries,
+  bool ok = match == JUMPER_TRIES;
+  appendf(out, len, "jumper check: GPIO34 followed GPIO26 %d/%d times -> %s\n", match, JUMPER_TRIES,
           ok ? "connected" : "NOT CONNECTED");
-  if (!ok)
-    appendf(out, len, "  GPIO34 read %s. The wire is not joining GPIO26 and GPIO34: check the\n"
-                      "  pin labels (34 and 26, not 35/36/39 or 25), breadboard rows and contact.\n",
-            highs == 0 ? "always low" : highs == tries ? "always high" : "random levels");
   return ok;
 }
 
-static bool runTune(uint16_t* buf, char* out, size_t len) {
+static void jumperHint(char* out, size_t len, int highs) {
+  appendf(out, len, "  GPIO34 read %s. The wire is not joining GPIO26 and GPIO34: check the\n"
+                    "  pin labels (34 and 26, not 35/36/39 or 25), breadboard rows and contact.\n",
+          highs == 0 ? "always low" : highs == JUMPER_TRIES ? "always high" : "random levels");
+}
+
+static TuneResult runTune(uint16_t* buf, char* out, size_t len) {
   static const uint8_t LEVELS[3] = {40, 128, 215};          // ~0.5, 1.65, 2.8 V
   // Some chips deliver each conversion twice, so 2 MS/s requested can mean
   // 1 MS/s of real samples. What counts is the unique rate.
@@ -326,27 +351,72 @@ static bool runTune(uint16_t* buf, char* out, size_t len) {
   out[0] = 0;
 
   i2sStop();
-  bool connected = jumperCheck(out, len);
-  if (!connected || sTuneJumperOnly) return connected;
+  int highs;
+  bool connected = jumperCheck(out, len, &highs);
+  if (sTuneJumperOnly) {
+    if (!connected) {
+      jumperHint(out, len, highs);
+      appendf(out, len, "  (Through a probe front-end the logic levels may not get across; `selftest`\n"
+                        "  checks with the ADC instead.)\n");
+    }
+    return connected ? TUNE_OK : TUNE_FAIL;
+  }
 
   // reference
   LevelStats ref[3];
   tuneStart({40000, 0, 0});
   bool refOk = true;
-  for (int l = 0; l < 3; l++) refOk &= measureLevel(buf, LEVELS[l], ref[l]);
+  for (int l = 0; l < 3; l++) refOk &= measureLevelMedian(buf, LEVELS[l], ref[l]);
   i2sStop();
   appendf(out, len, "reference @40kS/s: %.0f %.0f %.0f (codes for DAC 40/128/215)\n",
           ref[0].mean, ref[1].mean, ref[2].mean);
-  if (!refOk || ref[2].mean - ref[0].mean < 1500 || ref[1].mean <= ref[0].mean || ref[2].mean <= ref[1].mean) {
-    appendf(out, len, "FAIL: reference readings don't follow the DAC levels on GPIO26.\n"
-                      "Check the GPIO26->GPIO34 jumper. If it is fine, run `adcdiag` and share the output.\n");
+  const float span = ref[2].mean - ref[0].mean;
+  const bool rising = refOk && ref[1].mean > ref[0].mean && ref[2].mean > ref[1].mean;
+  if (rising && span < 1500) {
+    // The levels arrive, only smaller: GPIO26 reaches GPIO34 through a divider
+    // (the probe front-end). The DAC steps are equal, so the middle level must
+    // land about half-way, with little noise next to the steps.
+    float midFrac = (ref[1].mean - ref[0].mean) / span;
+    float noise = fmaxf(ref[0].sd, fmaxf(ref[1].sd, ref[2].sd));
+    if (span >= 50 && midFrac > 0.3f && midFrac < 0.7f && noise < span / 6) {
+      // DAC 40 -> 215 is about 175/256 of 3.3 V straight out of GPIO26
+      float pinMv = codeToMv(ref[2].mean) - codeToMv(ref[0].mean);
+      appendf(out, len, "GPIO34 follows GPIO26 at about 1/%.0f: there is a front-end in between.\n",
+              2256.0f / pinMv);
+      // The timing in use was tuned on a plain jumper. Behind the front-end's
+      // source resistance a short sample window reads off; the reference
+      // (default timing, 400 ns window) doesn't.
+      const HwCfg cur = savedCfg();
+      float off[3] = {0, 0, 0}, err = 0;
+      bool curOk = tuneStart(cur);
+      for (int l = 0; l < 3 && curOk; l++) {
+        LevelStats st;
+        curOk = measureLevelMedian(buf, LEVELS[l], st);
+        off[l] = st.mean - ref[l].mean;
+        err = fmaxf(err, fabsf(off[l]));
+      }
+      i2sStop();
+      if (curOk)
+        appendf(out, len, "ADC timing in use (SAR div %d, cycles %d) vs reference: %+.0f %+.0f %+.0f codes\n",
+                cur.div, cur.cyc, off[0], off[1], off[2]);
+      if (curOk && err > 10)
+        appendf(out, len, "WARNING: its sample window is too short to settle behind the front-end.\n"
+                          "Re-run selftest on the plain jumper to re-tune, then this one again.\n");
+      dac_output_disable(DAC_CHANNEL_2);
+      return TUNE_FRONTEND;
+    }
+  }
+  if (!rising || span < 1500) {
+    appendf(out, len, "FAIL: reference readings don't follow the DAC levels on GPIO26.\n");
+    if (!connected) jumperHint(out, len, highs);
+    else appendf(out, len, "Check the GPIO26->GPIO34 wiring. If it is fine, run `adcdiag` and share the output.\n");
     dac_output_disable(DAC_CHANNEL_2);
-    return false;
+    return TUNE_FAIL;
   }
 
   HwCfg best = {0, 0, 0};
   bool bestDup = false;
-  uint32_t bestReal = 0;
+  uint32_t bestReal = 0, bestWin = 0;
   float bestScore = 1e9f;
   appendf(out, len, "request  div cyc  err  noise  dup   real    result\n");
   for (uint32_t rate : RATES) {
@@ -375,14 +445,33 @@ static bool runTune(uint16_t* buf, char* out, size_t len) {
       bool unique = dup - chance < 0.08f;
       uint32_t real = doubled ? rate / 2 : unique ? rate : 0;
       bool accurate = ok && err <= 30 && noise <= 30 && chan > 0.99f;
+      // Unique on this start can mean repeated on the next (a v3.1 chip went
+      // from 7% repeats to 100% between starts), and startHw() then drops to
+      // one of each pair. Only count full rate if it survives two restarts.
+      bool flaky = false;
+      for (int k = 0; k < 2 && accurate && unique && !doubled; k++) {
+        LevelStats st;
+        flaky = !tuneStart(h) || !measureLevel(buf, LEVELS[1], st) || st.dup - chanceEqual(st.sd) >= 0.08f;
+        i2sStop();
+        if (flaky) {
+          real = rate / 2;
+          doubled = true;   // use one of each pair: evenly spaced either way
+          break;
+        }
+      }
       bool good = accurate && real > 0;
       appendf(out, len, "%-8lu %3d %3d %5.0f %5.1f %3.0f%%  %4luk   %s\n", (unsigned long)rate, h.div, h.cyc,
               err, noise, dup * 100, (unsigned long)(real / 1000),
-              !ok ? "no data" : chan <= 0.99f ? "wrong channel" : !accurate ? "bad" : real == 0 ? "irregular" : "ok");
-      // highest real sample rate wins, then accuracy + noise
-      if (good && (real > bestReal || (real == bestReal && err + noise < bestScore))) {
+              !ok ? "no data" : chan <= 0.99f ? "wrong channel" : !accurate ? "bad" : real == 0 ? "irregular"
+                  : flaky ? "ok, repeats after restart" : "ok");
+      // highest real sample rate wins, then the longest sample window (any
+      // front-end has source resistance), then accuracy + noise
+      const uint32_t win = sampleWindow(h);
+      if (good && (real > bestReal ||
+                   (real == bestReal && (win > bestWin || (win == bestWin && err + noise < bestScore))))) {
         best = h;
         bestReal = real;
+        bestWin = win;
         bestScore = err + noise;
         bestDup = doubled;
       }
@@ -402,7 +491,7 @@ static bool runTune(uint16_t* buf, char* out, size_t len) {
     dac_output_disable(DAC_CHANNEL_2);
     appendf(out, len, "reference again: %.0f %.0f %.0f%s\n", again[0].mean, again[1].mean, again[2].mean,
             againOk && fabsf(again[1].mean - ref[1].mean) < 100 ? "" : "  (test signal lost during tuning)");
-    return false;
+    return TUNE_FAIL;
   }
   S.hwRate = best.rate;
   S.sarClkDiv = best.div;
@@ -412,7 +501,7 @@ static bool runTune(uint16_t* buf, char* out, size_t len) {
     appendf(out, len, "every conversion arrives twice: using one of each pair (%lu S/s real)\n",
             (unsigned long)bestReal);
   appendf(out, len, "chosen: %lu S/s, SAR div %d, cycles %d\n", (unsigned long)best.rate, best.div, best.cyc);
-  return true;
+  return TUNE_OK;
 }
 
 // ============================================================ engine state
@@ -447,6 +536,9 @@ static int64_t  pubWindowStart = 0;
 
 // decimator
 static uint32_t acc = 0, dcnt = 0;
+
+// deglitch: the two conversions before the current one
+static uint16_t dg1 = 0, dg2 = 0;
 
 // counter (gate-relative sample index)
 static uint32_t cN = 0, cRises = 0, cHighCount = 0, cHighAtFirst = 0, cHighAtLast = 0;
@@ -612,9 +704,10 @@ static void finishGate() {
     r.freq = 0;
     r.duty = cHi ? 1.0f : 0.0f;
   }
-  // thresholds for the next gate: signal midpoint, hysteresis = 1/8 of swing
+  // thresholds for the next gate: signal midpoint, hysteresis +-1/8 of the
+  // swing, wider than the odd ADC glitch the deglitch filter lets through
   int mid = ((int)cMin + (int)cMax) / 2;
-  int h = span / 16;
+  int h = span / 8;
   if (h < 4) h = 4;
   cThHi = mid + h;
   cThLo = mid - h;
@@ -656,13 +749,25 @@ static void processChunk(const uint16_t* buf, int n, int64_t now) {
   const int step = halfRate() ? 2 : 1;
   const int sw = (S.swapPairs && step == 1) ? 1 : 0;
   const uint16_t inv = S.invert ? 0x0FFF : 0;
+  const bool deglitch = !S.deglitchOff;
   const bool capturing = sState != ACQ_STOPPED;
   const uint32_t D = d.D;
   const float invD16 = d.invD16;
   uint32_t chunkSum = 0;
 
   for (int i = 0; i < n; i += step) {
-    const uint16_t code = (buf[i ^ sw] & 0x0FFF) ^ inv;
+    uint16_t code = (buf[i ^ sw] & 0x0FFF) ^ inv;
+    if (deglitch) {
+      // Median of the last three conversions. Now and then the SAR decides one
+      // bit wrong and a single conversion lands tens of codes off (exactly
+      // 0x5FF when the input is just above 0x600). Front-end B scales that to
+      // half-volt spikes and extra counter edges. Costs features narrower than
+      // two samples, i.e. counting above ~fs/4.
+      const uint16_t lo = dg1 < dg2 ? dg1 : dg2, hi = dg1 < dg2 ? dg2 : dg1;
+      dg2 = dg1;
+      dg1 = code;
+      code = code < lo ? lo : code > hi ? hi : code;
+    }
 
     // --- frequency counter ---
     if (!cHi) {
@@ -748,7 +853,7 @@ static void acqTask(void*) {
 
   for (;;) {
     if (sTuneReq || sReinitReq) {
-      if (sTuneReq) sTuneOk = runTune(buf, sTuneOut, sTuneOutLen);   // stops the driver itself
+      if (sTuneReq) sTuneResult = runTune(buf, sTuneOut, sTuneOutLen);   // stops the driver itself
       else i2sStop();
       startHw(savedCfg(), buf);
       if (sTuneReq) sTuneDone = true;
@@ -820,7 +925,7 @@ float acqCpuLoad() { return sCpuLoad; }
 
 void acqReinit() { sReinitReq = true; }
 
-bool acqTune(char* out, size_t len, uint32_t timeoutMs, bool jumperOnly) {
+TuneResult acqTune(char* out, size_t len, uint32_t timeoutMs, bool jumperOnly) {
   out[0] = 0;
   sTuneJumperOnly = jumperOnly;
   sTuneOut = out;
@@ -829,7 +934,7 @@ bool acqTune(char* out, size_t len, uint32_t timeoutMs, bool jumperOnly) {
   sTuneReq = true;
   uint32_t t0 = millis();
   while (!sTuneDone && millis() - t0 < timeoutMs) delay(20);
-  return sTuneDone && sTuneOk;
+  return sTuneDone ? sTuneResult : TUNE_FAIL;
 }
 
 uint32_t acqCaptureRaw(uint16_t* dst, uint32_t n, uint32_t timeoutMs) {

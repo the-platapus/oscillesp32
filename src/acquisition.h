@@ -52,8 +52,11 @@ void  acqReinit();
 // Finds the fastest ADC rate/timing that reads correctly (needs GPIO26
 // jumpered to GPIO34; drives GPIO26 itself, so the square generator must be
 // released first). Starts with a digital continuity check of the jumper;
-// jumperOnly stops after it. Writes a report into out; updates S on success.
-bool  acqTune(char* out, size_t len, uint32_t timeoutMs, bool jumperOnly = false);
+// jumperOnly stops after it. Writes a report into out; updates S on TUNE_OK.
+// TUNE_FRONTEND: GPIO26 reaches GPIO34 only through an attenuating front-end,
+// too small a swing to tune with; the ADC settings are left alone.
+enum TuneResult : uint8_t { TUNE_FAIL = 0, TUNE_OK = 1, TUNE_FRONTEND = 2 };
+TuneResult acqTune(char* out, size_t len, uint32_t timeoutMs, bool jumperOnly = false);
 
 // conversions
 float    codeToMv(float code);          // ADC code (may be fractional) -> pin mV

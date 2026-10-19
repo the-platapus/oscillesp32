@@ -32,6 +32,7 @@ float siggenSquareActualHz() { return 0; }
 float siggenSineActualHz() { return 0; }
 float siggenOverrideSquare(float, float) { return 0; }
 void siggenReleaseSquare() {}
+void siggenHoldSquare(int) {}
 void siggenRestoreDac() {}
 
 // ---- simulation ----
@@ -41,6 +42,20 @@ static std::mt19937 rng(1234);
 static std::normal_distribution<double> noise(0.0, 2.0);   // ~2 LSB rms, like a quiet ESP32 ADC
 
 static bool sDupSim = false;   // emulate chips that deliver every conversion twice
+static double sGlitchRate = 0; // share of conversions hit by a SAR bit-decision error
+static std::uniform_real_distribution<double> uni(0.0, 1.0);
+
+// What the real ADC does now and then: one conversion decides a bit wrong.
+// Just above 0x600 it lands on 0x5FF; elsewhere it drops by tens of codes.
+// A third of them hit the next conversion too, like the bursts on hardware.
+static uint16_t glitch(uint16_t c) {
+  static bool burst = false;
+  if (sGlitchRate <= 0) return c;
+  if (!burst && uni(rng) >= sGlitchRate) return c;
+  burst = !burst && uni(rng) < 0.33;
+  if (c >= 0x600 && c < 0x640) return 0x5FF;
+  return c > 60 ? c - 60 : 0;
+}
 static int fails = 0, checks = 0;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { fails++; printf("  FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
@@ -63,9 +78,9 @@ static void run(const Sig& sig, double sec, const std::function<void(const Frame
   for (long c = 0; c < chunks; c++) {
     if (sDupSim) {
       // one conversion per pair of DMA words, at half the word rate
-      for (int i = 0; i < 1024; i += 2) buf[i] = buf[i + 1] = mvToCode(sig((sIdx + i) / FS));
+      for (int i = 0; i < 1024; i += 2) buf[i] = buf[i + 1] = glitch(mvToCode(sig((sIdx + i) / FS)));
     } else {
-      for (int i = 0; i < 1024; i++) buf[i] = mvToCode(sig((sIdx + i) / FS));
+      for (int i = 0; i < 1024; i++) buf[i] = glitch(mvToCode(sig((sIdx + i) / FS)));
       // the I2S DMA delivers each pair of 16-bit samples swapped
       for (int i = 0; i < 1024; i += 2) { uint16_t t = buf[i]; buf[i] = buf[i + 1]; buf[i + 1] = t; }
     }
@@ -323,6 +338,52 @@ int main() {
     sDupSim = false;
     S.dupPairs = 0;
     settingsChanged();
+  }
+
+  // ---------------------------------------------------------------- 14
+  printf("[14] front-end B: 105 Hz sine, 0.29 Vpp at the pin, 2%% of conversions a bit off\n");
+  {
+    // as seen on hardware: 22k/22k/100k front-end, laptop audio out, 2.9 Vpp
+    cmd("tdiv 5ms");
+    cmd("cal 1500 10");
+    cmd("tlevel 0");
+    sGlitchRate = 0.02;
+    cmd("deglitch off");
+    run(sine(105, 1500, 144), 3.0);   // the counter re-learns its thresholds within a few gates
+    CounterResult raw = acqGetCounter();
+    cmd("deglitch on");
+    run(sine(105, 1500, 144), 2.0);
+    float worst = 0;
+    run(sine(105, 1500, 144), 1.0, [&](const Frame& f) {
+      processFrame(f, acqGetCounter(), proc);
+      // the trace must stay on the sine: no spikes past its peaks
+      worst = fmaxf(worst, fmaxf(proc.m.vmax - 1.44f, -1.44f - proc.m.vmin));
+    });
+    CounterResult c = acqGetCounter();
+    printf("    counter without filter %.2f Hz, with %.4f Hz; peaks beyond the sine %.0f mV, gate min/max %.2f/%.2f V\n",
+           raw.freq, c.freq, worst * 1000, pinMvToVolts(c.minMv), pinMvToVolts(c.maxMv));
+    CHECK(fabsf(c.freq - 105) < 0.05f, "freq %.4f", c.freq);
+    CHECK(worst < 0.15f, "trace peaks %.0f mV beyond the sine", worst * 1000);
+    sGlitchRate = 0;
+    cmd("fe direct");
+  }
+
+  // ---------------------------------------------------------------- 15
+  printf("[15] counter range with the deglitch filter: 200 kHz square\n");
+  {
+    cmd("tdiv 5us");
+    cmd("tlevel 1.6");
+    for (double hz : {200000.0, 250000.0, 300000.0}) {
+      cmd("deglitch on");
+      run(square(hz, 100, 3100), 3.0);
+      float on = acqGetCounter().freq;
+      cmd("deglitch off");
+      run(square(hz, 100, 3100), 3.0);
+      float off = acqGetCounter().freq;
+      printf("    %.0f kHz: filter on %.2f Hz, off %.2f Hz\n", hz / 1000, on, off);
+      if (hz == 200000.0) CHECK(fabsf(on - hz) < 10, "200 kHz with filter: %.2f", on);
+    }
+    cmd("deglitch on");
   }
 
   // ---------------------------------------------------------------- 11

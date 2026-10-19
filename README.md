@@ -46,7 +46,7 @@ tin.
 | Sample rate | ~1 MS/s of real, evenly spaced samples (the reference board measured 992,188 S/s). `selftest` finds your chip's best setting, up to ~2 MS/s if it can manage it. |
 | Resolution | 12-bit, averaged up to sub-LSB on slow timebases |
 | Timebase | 5 µs/div … 5 s/div, roll mode from 100 ms/div |
-| Bandwidth | waveform shape up to ~100 kHz; frequency counter up to ~400 kHz |
+| Bandwidth | waveform shape up to ~100 kHz; frequency counter up to ~250 kHz (~400 kHz with `deglitch off`) |
 | Frequency counter | runs on every sample, crystal-accurate after `selftest` (~1 ppm) |
 | Input | 0–3.1 V direct, about ±15 V with a 3-resistor front-end |
 | Trigger | rising/falling edge, Auto / Normal / Single, 5–95 % pre-trigger, sub-sample interpolation (no jitter dance) |
@@ -161,14 +161,27 @@ through long transfers. Prefer a web flasher? Use
    - checks the wire with plain logic levels first (`jumpercheck` runs just this bit);
    - uses GPIO26 as a DAC to put known voltages on the input, then tries ADC
      rates and timings until it finds the fastest one that still reads them
-     like a slow, careful reference;
-   - spots whether your chip is sending each sample twice (some do, see below);
+     like a slow, careful reference. At equal speed it takes the longest
+     sample window, which your front-end will thank it for (see below);
+   - spots whether your chip is sending each sample twice (some do, see below),
+     restarting the ADC to make sure;
    - checks sample order and polarity;
    - measures a crystal-accurate 10 kHz signal and corrects the timebase;
    - saves all of it.
 4. Pull the jumper. You now own a calibrated oscilloscope.
 
-Built front-end B? Calibrate it too:
+Built front-end B? Calibrate it too. Clip the probe tip onto GPIO26 and run
+`selftest` again. It sees GPIO26 arriving at about 1/10 size, so it knows the
+front-end is there. It keeps the ADC timing from the jumper run and calibrates
+the front-end from GPIO26's two logic levels: low is exactly 0 V, high is the
+3V3 rail. It assumes 3.30 V. For an exact gain, measure the 3V3 pin with your
+multimeter and give it the reading:
+
+```
+selftest 3.29
+```
+
+Or do it by hand, with any known voltage:
 
 ```
 fe bias
@@ -227,7 +240,8 @@ view scope|meter|fft|info|next
 fe direct|bias|custom   calzero   calgain <V>   cal <zero_mV> <gain>
 gen sq <Hz> [duty%] | gen sq off | gen sine <Hz> | gen sine off
 wifi ap | wifi off | wifi join "ssid" "password"
-selftest | jumpercheck | adcdiag | adccfg <rate> [sar_div] [cycles] [dup]
+selftest [3V3 volts] | jumpercheck | adcdiag [raw] | adccfg <rate> [sar_div] [cycles] [dup]
+deglitch on|off
 status | save | factory | help
 ```
 
@@ -257,6 +271,27 @@ handles them all for you, but in case you're building your own:
   register. The negative half of the wave falls off the bottom of the DAC and
   you get a row of half-sine humps. The firmware writes the real zero after
   configuring it.
+- **The SAR sometimes decides a bit wrong.** Now and then a single
+  conversion lands tens of codes low. Just above a major transition it lands
+  on the code below it: 0x5FF instead of 0x600-ish, 0x6FF instead of 0x700-ish.
+  Next to a full-scale signal that's a 1 % blip. Through front-end B it's a
+  half-volt spike, and enough of them made a 105 Hz sine count as 1.6–1.9 kHz.
+  The firmware runs a median-of-3 filter over the samples (`deglitch off`
+  skips it and gets the counter back up to ~400 kHz), and the counter's
+  hysteresis is ±1/8 of the swing.
+- **...and the transition at 0x600 is a mess.** On the reference board codes
+  1536–1567 never come out. Inputs there read 0x5FF, and up to 1583 a quarter
+  of them still do. That's about 1.36 V at the pin, or about −1.4 V through
+  front-end B, and no median can fix errors that frequent. A sine whose
+  troughs sit there gets spiky troughs. Fixing it needs a per-code (DNL)
+  calibration, which isn't done yet.
+- **A short sample window doesn't settle behind a resistor.** Through
+  front-end B (22k/22k/100k, about 10 kΩ at the pin), SAR div 2 with 2 cycles
+  (a 50 ns window) read ~20 mV low at the pin and calibrated the gain 3–5 %
+  wrong. Div 4 with 6 cycles (300 ns) at the same real rate read within a few
+  codes and calibrated to 10.08 V/V, right where the resistors say. The tuner
+  can't see this over a plain wire, so it now picks the longest window at the
+  fastest rate. The front-end self-test checks it too.
 - **A floating ADC pin reads ~0.2 V with random spikes.** If the self-test says
   your 3.3 V square peaks at 985 codes, check which pin your jumper is in
   before blaming silicon. (See: "ask us how we know".)

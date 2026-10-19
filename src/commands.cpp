@@ -23,11 +23,11 @@ static const char* HELP =
   "calzero                 (probe shorted to GND)\n"
   "calgain <V>             (probe on a known voltage, e.g. 5.00)\n"
   "cal <zero_mV> <gain>    (manual)\n"
-  "swap 0|1  invert 0|1  ratecorr <factor>\n"
-  "adccfg <rate> [sar_div] [cycles] [dup]   adcdiag   jumpercheck\n"
+  "swap 0|1  invert 0|1  ratecorr <factor>  deglitch on|off\n"
+  "adccfg <rate> [sar_div] [cycles] [dup]   adcdiag [raw]   jumpercheck\n"
   "gen sq <Hz> [duty%] | gen sq off | gen sine <Hz> | gen sine off\n"
   "wifi ap | wifi off | wifi join \"ssid\" \"password\"\n"
-  "selftest                (jumper GPIO26 -> GPIO34 first)\n"
+  "selftest [3V3 volts]    (jumper GPIO26 -> GPIO34, or probe on GPIO26)\n"
   "status | save | factory | help";
 
 // ------------------------------------------------------------- helpers
@@ -183,25 +183,71 @@ void commandsPoll() {
 
 // ------------------------------------------------------------- selftest
 
-static std::string selftest() {
-  std::string r = "SELFTEST (expects GPIO26 wired straight to GPIO34)\n";
+// keeps a bipolar front-end's trace on screen: 0 V mid-screen
+static void bipolarView() { S.vpos = 0; S.trigLevel = 0; S.vdiv = 8; }
+
+// Front-end calibration through the probe: GPIO26 held low puts 0 V on the
+// probe, held high puts the 3V3 rail there (front-end B draws ~15 uA, which
+// moves a GPIO output by well under a millivolt). Two points: zero and gain.
+static bool frontEndCal(std::string& r, float vdd, bool vddGiven) {
+  float mv[2];
+  for (int lvl = 0; lvl < 2; lvl++) {
+    siggenHoldSquare(lvl);
+    // the first fresh gate may straddle the switch
+    if (!waitGates(2)) { r += "FAIL: counter timed out\n"; return false; }
+    mv[lvl] = acqGetCounter().meanMv;
+  }
+  r += fmt("front-end: probe at 0 V -> %.1f mV at GPIO34, at %.2f V%s -> %.1f mV\n",
+           mv[0], vdd, vddGiven ? "" : " (3V3 rail, assumed)", mv[1]);
+  const float adcLo = codeToMv(0) + 20, adcHi = codeToMv(4095) - 20;
+  if (mv[0] < adcLo || mv[1] > adcHi) {
+    r += fmt("FAIL: GPIO34 reached the end of the ADC range (%.0f..%.0f mV).\n", adcLo, adcHi);
+    return false;
+  }
+  float dv = (mv[1] - mv[0]) * 0.001f;
+  if (dv < 0.02f) { r += "FAIL: GPIO34 barely rises with GPIO26.\n"; return false; }
+  Lock lk;
+  if (S.frontEnd == FE_DIRECT) bipolarView();
+  S.calZero = mv[0];
+  S.calGain = vdd / dv;
+  S.frontEnd = FE_CUSTOM;
+  settingsChanged();
+  r += fmt("calibrated: zero %.1f mV, gain %.3f V/V, probe range about %+.1f..%+.1f V\n",
+           S.calZero, S.calGain, pinMvToVolts(codeToMv(0)), pinMvToVolts(codeToMv(4095)));
+  if (!vddGiven) r += "  (for an exact gain, measure the 3V3 pin and run `selftest <volts>`)\n";
+  return true;
+}
+
+static std::string selftest(float vdd, bool vddGiven) {
+  std::string r = "SELFTEST (GPIO26 wired to GPIO34, straight or through the probe front-end)\n";
 
   // 1. find the fastest ADC rate/timing that reads DC levels correctly
   r += "[1/3] tuning ADC timing (takes ~10 s)...\n";
   siggenReleaseSquare();
   delay(20);
   static char report[2000];
-  bool tuned = acqTune(report, sizeof(report), 30000);
+  TuneResult tuned = acqTune(report, sizeof(report), 30000);
   r += report;
-  if (!tuned) {
+  if (tuned == TUNE_FAIL) {
     siggenOverrideSquare(0, 0);
     return r + "Tuning failed; ADC settings unchanged.";
   }
-  {
-    Lock lk;
-    settingsChanged();
+  if (tuned == TUNE_OK) {
+    {
+      Lock lk;
+      settingsChanged();
+    }
+    r += fmt("ADC now %.0f S/s\n", acqSampleRate());
+  } else {
+    // too small a swing to judge ADC timing by, but just what the front-end
+    // calibration needs
+    r += fmt("ADC timing is only tuned over a plain jumper; keeping the current %.0f S/s.\n",
+             acqSampleRate());
+    if (!frontEndCal(r, vdd, vddGiven)) {
+      siggenOverrideSquare(0, 0);
+      return r + "Front-end calibration failed; calibration unchanged.";
+    }
   }
-  r += fmt("ADC now %.0f S/s\n", acqSampleRate());
 
   // 2. sample order and polarity, from a 10 kHz 25% square
   r += "[2/3] sample order and polarity\n";
@@ -254,14 +300,26 @@ static std::string selftest() {
   }
 
   // 3. timebase: the LEDC square comes from the crystal, so the counter's
-  // reading of it gives the true ADC rate
+  // reading of it gives the true ADC rate. Median of 5 gates: now and then a
+  // gate gains or loses an edge (400 ppm at 10 kHz), more so behind a front-end.
   r += "[3/3] timebase\n";
-  if (waitGates(3)) {
-    CounterResult c = acqGetCounter();
-    r += fmt("counter: %.3f Hz (generator %.3f Hz), duty %.2f%%\n", c.freq, sqHz, c.duty * 100);
-    if (c.freq > 0 && sqHz > 0 && fabsf(c.freq / sqHz - 1) < 0.03f) {
+  float gates[5];
+  int ng = 0;
+  CounterResult c = {};
+  if (waitGates(2)) {   // the first fresh gate may straddle the switch to 10 kHz
+    for (; ng < 5 && waitGates(1); ng++) {
+      c = acqGetCounter();
+      gates[ng] = c.freq;
+    }
+  }
+  if (ng == 5) {
+    std::sort(gates, gates + 5);
+    const float f = gates[2];
+    r += fmt("counter: %.3f Hz, median of %.3f..%.3f (generator %.3f Hz), duty %.2f%%\n",
+             f, gates[0], gates[4], sqHz, c.duty * 100);
+    if (f > 0 && sqHz > 0 && fabsf(f / sqHz - 1) < 0.03f) {
       Lock lk;
-      S.rateCorr = S.rateCorr * sqHz / c.freq;
+      S.rateCorr = S.rateCorr * sqHz / f;
       settingsChanged();
       r += fmt("rate correction %.6f -> ADC %.1f S/s\n", S.rateCorr, acqSampleRate());
     } else {
@@ -278,8 +336,8 @@ static std::string selftest() {
 }
 
 // Raw look at what the DMA delivers right now: which ADC channel the words
-// come from, and the spread of the 12-bit codes.
-static std::string adcdiag() {
+// come from, and the spread of the 12-bit codes. `all` appends every word.
+static std::string adcdiag(bool all) {
   const uint32_t N = 4096;
   uint16_t* raw = (uint16_t*)malloc(N * sizeof(uint16_t));
   if (!raw) return "out of memory";
@@ -307,8 +365,8 @@ static std::string adcdiag() {
   r += fmt(" (expect ch%d)\n", (int)PROBE_ADC_CHANNEL);
   r += fmt("codes: min %d max %d mean %.1f sd %.1f\nhistogram (512-code bins):", mn, mx, mean, var > 0 ? sqrt(var) : 0);
   for (int i = 0; i < 8; i++) r += fmt(" %lu", (unsigned long)bins[i]);
-  r += "\nfirst words:";
-  for (int i = 0; i < 16; i++) r += fmt(" %04x", raw[i]);
+  r += all ? "\nwords:" : "\nfirst words:";
+  for (uint32_t i = 0; i < (all ? N : 16); i++) r += fmt("%s%04x", i % 16 ? " " : "\n", raw[i]);
   free(raw);
   return r;
 }
@@ -323,7 +381,7 @@ std::string statusJson() {
     "\"tdiv\":%d,\"vdiv\":%d,\"vpos\":%.4f,\"hpos\":%.3f,\"cpl\":%d,"
     "\"tmode\":%d,\"tedge\":%d,\"tlevel\":%.4f,\"view\":%d,"
     "\"fe\":%d,\"calZero\":%.2f,\"calGain\":%.5f,\"swap\":%d,\"inv\":%d,\"rateCorr\":%.6f,"
-    "\"hwRate\":%lu,\"sarDiv\":%d,\"sarCyc\":%d,\"dup\":%d,\"load\":%.2f,"
+    "\"hwRate\":%lu,\"sarDiv\":%d,\"sarCyc\":%d,\"dup\":%d,\"dgl\":%d,\"load\":%.2f,"
     "\"fs\":%.1f,\"fsMeas\":%.1f,\"fsReq\":%.0f,\"fps\":%.1f,\"calSrc\":\"%s\","
     "\"freq\":%.4f,\"duty\":%.4f,\"dcMean\":%.4f,\"dcMin\":%.4f,\"dcMax\":%.4f,"
     "\"gsq\":%d,\"gsqHz\":%.3f,\"gsqDuty\":%.2f,\"gsqAct\":%.3f,"
@@ -333,7 +391,7 @@ std::string statusJson() {
     S.tdiv, S.vdiv, S.vpos, S.hpos, S.coupling,
     S.trigMode, S.trigEdge, S.trigLevel, S.view,
     S.frontEnd, S.calZero, S.calGain, S.swapPairs, S.invert, S.rateCorr,
-    (unsigned long)S.hwRate, S.sarClkDiv, S.sarCycles, acqHalfRate() ? 1 : 0, acqCpuLoad(),
+    (unsigned long)S.hwRate, S.sarClkDiv, S.sarCycles, acqHalfRate() ? 1 : 0, S.deglitchOff ? 0 : 1, acqCpuLoad(),
     acqSampleRate(), acqMeasuredRate(), acqRequestedRate(), acqFrameRate(), acqCalSource(),
     c.freq, c.duty, pinMvToVolts(c.meanMv), pinMvToVolts(c.minMv), pinMvToVolts(c.maxMv),
     S.genSquareOn, S.genSquareHz, S.genSquareDuty, siggenSquareActualHz(),
@@ -355,10 +413,14 @@ std::string runCommand(const std::string& lineIn) {
   float f;
 
   // --- commands that wait: no lock held while waiting ---
-  if (cmd == "selftest") return selftest();
-  if (cmd == "adcdiag") return adcdiag();
+  if (cmd == "selftest") {
+    if (a.empty()) return selftest(3.3f, false);
+    if (!parseFloat(a, f) || f < 2.8f || f > 3.6f) return "err: selftest [3V3 pin volts, 2.8..3.6]";
+    return selftest(f, true);
+  }
+  if (cmd == "adcdiag") return adcdiag(al == "raw");
   if (cmd == "jumpercheck") {
-    char out[400];
+    char out[600];
     siggenReleaseSquare();
     acqTune(out, sizeof(out), 5000, true);
     siggenOverrideSquare(0, 0);
@@ -471,7 +533,7 @@ std::string runCommand(const std::string& lineIn) {
     else if (al == "custom") applyFrontEndPreset(FE_CUSTOM);
     else return "err: fe direct|bias|custom";
     // keep the trace on screen after a range change
-    if (S.frontEnd == FE_BIAS) { S.vpos = 0; S.trigLevel = 0; S.vdiv = 8; }
+    if (S.frontEnd == FE_BIAS) bipolarView();
     if (S.frontEnd == FE_DIRECT) { S.vpos = -1.5f; S.trigLevel = 1.5f; S.vdiv = 5; }
   }
   else if (cmd == "cal") {
@@ -480,6 +542,11 @@ std::string runCommand(const std::string& lineIn) {
     S.calZero = f;
     S.calGain = g;
     S.frontEnd = FE_CUSTOM;
+  }
+  else if (cmd == "deglitch") {
+    if (al == "on") S.deglitchOff = 0;
+    else if (al == "off") S.deglitchOff = 1;
+    else return "err: deglitch on|off";
   }
   else if (cmd == "swap") S.swapPairs = atoi(a.c_str()) ? 1 : 0;
   else if (cmd == "invert") S.invert = atoi(a.c_str()) ? 1 : 0;
